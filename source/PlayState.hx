@@ -1,5 +1,8 @@
 package;
 
+import flixel.sound.FlxSound;
+import flixel.text.FlxText;
+import flixel.util.FlxTimer;
 import flixel.tweens.FlxEase;
 import flixel.tweens.FlxTween;
 import flixel.effects.particles.FlxEmitter;
@@ -24,6 +27,9 @@ import PauseSubState;
 import OptionsState;
 import Enemy;
 import DialogBox;
+
+import sys.io.File;
+import sys.FileSystem;
 
 using flixel.util.FlxSpriteUtil;
 
@@ -52,14 +58,27 @@ class PlayState extends FlxState
     var rain:FlxEmitter;
 
     var dialogBox:DialogBox;
+    var stageTimes = [0, 60000, 124000, 160000, 202000]; // 各阶段起始点
+    var anySees = false;
     private var interactingSpirit:Bool;
     public static var fromPause:Bool = false;
 
-    // ---- 冷却计时器 ----
-    private var damageCooldown:Float = 0.0;        // 2秒受伤冷却
-    private var slowmoTimer:Float = 0.0;          // 用于恢复时间
+    private var damageCooldown:Float = 0.0;
+    private var slowmoTimer:Float = 0.0;
 
     var lines = DialogueData.getIntro();
+
+    private var allSpiritsCollected:Bool = false;
+    private var finalDialogueTriggered:Bool = false;
+
+    private var endingActive:Bool = false;
+    private var endingTimer:Float = 0;
+    private var endingTextGroup:FlxGroup;
+    private var exiting:Bool = false;
+
+    var bgm:FlxSound;
+    var currentStage:Int = -1; // 当前阶段索引
+    var maxDist:Float = 400;   // 最大影响距离
 
     override public function create():Void
     {
@@ -71,6 +90,11 @@ class PlayState extends FlxState
         #end
 
         FlxG.camera.bgColor = FlxColor.BLACK;
+
+        bgm = FlxG.sound.load(LoadPaths.loadPaths("m", "Rainy Alter"));
+        bgm.looped = true; // 循环播放
+        bgm.play();
+        setStage(0);
 
         hudCamera = new FlxCamera(0, 0, FlxG.width, FlxG.height);
         hudCamera.bgColor = FlxColor.TRANSPARENT;
@@ -112,7 +136,6 @@ class PlayState extends FlxState
         hud.camera = hudCamera;
         add(hud);
 
-        // 强制玩家、敌人、精灵组在最上层
         remove(player);
         add(player);
         remove(enemies);
@@ -131,8 +154,8 @@ class PlayState extends FlxState
         rain.y = -10;
         rain.width = FlxG.width;
         rain.height = 10;
-        rain.acceleration.set(0, 400); // 重力加速度固定
-        rain.velocity.set(0, 200, 0, 200); // 垂直速度固定为 200（无水平速度）
+        rain.acceleration.set(0, 400);
+        rain.velocity.set(0, 200, 0, 200);
         rain.lifespan.set(0.6, 1.2);
         rain.alpha.set(0.4, 0.8);
         rain.start(false, 0.025, 0);
@@ -142,14 +165,29 @@ class PlayState extends FlxState
         fog.scrollFactor.set(0, 0);
         fog.alpha = 0.6;
 
-        FlxTween.tween(fog, { alpha: 0.8 }, 5, {type: PINGPONG,
-			ease: FlxEase.sineInOut,});
+        FlxTween.tween(fog, { alpha: 0.8 }, 5, {
+            type: FlxTweenType.PINGPONG,
+            ease: FlxEase.sineInOut
+        });
         add(fog);
+
         dialogBox = new DialogBox();
         add(dialogBox);
 
         dialogBox.startDialogue(lines);
     }
+
+function setStage(index:Int):Void
+{
+    if (index == currentStage) return;
+    if (index < 0 || index >= stageTimes.length) return;
+
+    currentStage = index;
+    var targetTime = stageTimes[index];
+    // 直接跳转时间（若音乐已播放，time 属性可读写）
+    bgm.time = targetTime;
+    trace("切换到阶段 " + index + "，时间 " + targetTime);
+}
 
     function loadMapAndLayers():Void
     {
@@ -218,21 +256,73 @@ class PlayState extends FlxState
 
     override public function update(elapsed:Float):Void
     {
+        anySees = false;
+        for (e in enemies.members) {
+    if (e != null && e.exists && e.alive && e.seesPlayer) {
+        anySees = true;
+        break;
+    }
+}
+
+        // 计算最近敌人距离
+    var nearestDist = getNearestEnemyDistance();
+
+    // 根据距离决定阶段索引
+    var targetStage = 0;
+
+    if (!endingActive) {
+if (nearestDist < 130 && anySees)
+        targetStage = 3;
+    // else if (nearestDist < 120)
+    //     targetStage = 3;      // 追逐
+    else if (nearestDist < 240) 
+        targetStage = 2; // 激烈
+    else if (nearestDist < 500) 
+        targetStage = 1; // 中等
+    else targetStage = 0;
+
+    if (targetStage != currentStage) {
+        setStage(targetStage);
+    }
+    }
+    
+    FlxG.watch.addQuick("Music time: + ", bgm.time / 1000);
+    FlxG.watch.addQuick("nearestDist:  ", nearestDist);
+    FlxG.watch.addQuick("cansee?:  ", anySees);
+        if (FlxG.keys.justPressed.CONTROL) {
+            player.spiritCount++;
+        }
+        if (!finalDialogueTriggered && player.spiritCount >= 5)
+        {
+            finalDialogueTriggered = true;
+            triggerFinalDialogue();
+        }
+
+        if (endingActive)
+        {
+            endingTimer -= elapsed;
+            if (endingTimer <= 0)
+            {
+                exitGame(true);
+            }
+        }
+
         flashTimer -= elapsed;
-        if (flashTimer <= 0 && Math.random() < 0.001) { // 约 0.1% 概率每秒触发
+        if (flashTimer <= 0 && Math.random() < 0.001)
+        {
             FlxG.camera.flash(FlxColor.WHITE, 0.1);
-            flashTimer = 3 + Math.random() * 5; // 3~8 秒后检查下一次
+            flashTimer = 3 + Math.random() * 5;
         }
 
         fog.scrollX -= 10 * elapsed;
         fog.scrollY += 3 * elapsed;
 
-        if (player.health <= 0.3) {
+        if (player.health <= 0.3)
+        {
             trace(player.health);
-            // FlxG.camera.bgColor = 0xABFF3370;
             FlxG.camera.flash(0xABFF3370, 1.1);
         }
-        // ---- 管理时间减速恢复 ----
+
         if (FlxG.timeScale < 1)
         {
             slowmoTimer -= elapsed;
@@ -242,7 +332,6 @@ class PlayState extends FlxState
             }
         }
 
-        // ---- 减少受伤冷却计时器 ----
         if (damageCooldown > 0) damageCooldown -= elapsed;
 
         updateSpiritInteraction();
@@ -262,25 +351,22 @@ class PlayState extends FlxState
             {
                 if (e != null && e.exists && e.alive && FlxG.overlap(e, player))
                 {
-                    // ---- 触发碰撞效果（冷却保护） ----
                     if (damageCooldown <= 0)
                     {
-                        // 扣除血量
                         FlxG.camera.shake(0.01, 0.2);
                         player.health -= 0.1;
                         damageCooldown = 2.0;
                         trace("Player hit! Remaining health: " + player.health);
 
-                        // 时间减缓 0.5 秒
                         FlxG.timeScale = 0.5;
                         slowmoTimer = 0.5;
 
-                        // 敌人闪烁并眩晕 2 秒
                         e.stun(2.0);
 
                         if (player.health <= 0)
                         {
                             trace("Player health reached 0! Resetting level.");
+                            exitGame(false);
                         }
                     }
                 }
@@ -292,26 +378,130 @@ class PlayState extends FlxState
         super.update(elapsed);
     }
 
-    function checkEnemyVision(enemy:Enemy)
+    function getNearestEnemyDistance():Float
 {
-    var enemyPos = enemy.getMidpoint();
-    var playerPos = player.getMidpoint();
-    var canSee = true;
-    for (obj in allWalls.members)
-    {
-        var tilemap:FlxTilemap = cast obj;
-        if (tilemap != null && !tilemap.ray(enemyPos, playerPos))
-        {
-            canSee = false;
-            break;
+    var nearest = Math.POSITIVE_INFINITY;
+    for (e in enemies.members) {
+        if (e != null && e.exists && e.alive) {
+            var d = FlxMath.distanceBetween(player, e);
+            if (d < nearest) nearest = d;
         }
     }
-    enemy.seesPlayer = canSee;
-    if (canSee)
-    {
-        enemy.playerPosition.set(playerPos.x, playerPos.y);
-    }
+    return nearest;
 }
+
+    private function triggerFinalDialogue():Void
+    {
+        player.active = false;
+        for (e in enemies.members)
+        {
+            if (e != null) e.active = false;
+        }
+
+        var lines:Array<{speaker:String, text:String}> = [
+            {speaker: "???", text: "WHAT HAVE YOU DONE?"},
+            {speaker: "???", text: "HAVE YOU REMEMBERED?"},
+            {speaker: "???", text: "HAVE YOU EVER REMEMBERED?"}
+        ];
+
+        dialogBox.startDialogue(lines, function() {
+            startEndingSequence();
+        });
+    }
+
+    private function startEndingSequence():Void
+{
+    if (endingActive) return;
+    endingActive = true;
+    endingTimer = 5.0;
+
+    hud.visible = false;
+
+    endingTextGroup = new FlxGroup();
+    endingTextGroup.camera = hudCamera;
+    add(endingTextGroup);
+
+    var totalWords = 1000;          // 增加总量
+    var added = 0;
+    var timer = new FlxTimer();
+
+    timer.start(0.1, function(t:FlxTimer) {
+        for (i in 0...9) {         // 每次生成 8 个
+            if (added >= totalWords) {
+                t.cancel();
+                return;
+            }
+            var text = new FlxText(
+                FlxG.random.float(0, FlxG.width),
+                FlxG.random.float(0, FlxG.height),
+                0,
+                randomCaseString("HAVE YOU EVER REMEMBERED?")
+            );
+            text.color = FlxColor.WHITE;
+            text.font = "Time New Roman";
+            text.size = FlxG.random.int(8, 24);  // 缩小字体使密度更高
+            text.alpha = FlxG.random.float(0.2, 1);
+            text.scrollFactor.set(0, 0);
+            endingTextGroup.add(text);
+
+            added++;
+            setStage(4);
+        }
+    }, -1);
+}
+
+    private function randomCaseString(original:String):String
+    {
+        var result = "";
+        for (i in 0...original.length) {
+            var ch = original.charAt(i);
+            if (FlxG.random.bool(50)) {
+                result += ch.toUpperCase();
+            } else {
+                result += ch.toLowerCase();
+            }
+        }
+        return result;
+    }
+
+    private function exitGame(deleteKey:Bool):Void
+    {
+        if (exiting) return;
+        exiting = true;
+
+        if (deleteKey) {
+            try {
+                if (FileSystem.exists("RAM.key")) {
+                    FileSystem.deleteFile("RAM.key");
+                    trace("RAM.key deleted.");
+                }
+            } catch (e:Dynamic) {
+                trace("Failed to delete RAM.key: " + e);
+            }
+        }
+        Sys.exit(0);
+    }
+
+    function checkEnemyVision(enemy:Enemy)
+    {
+        var enemyPos = enemy.getMidpoint();
+        var playerPos = player.getMidpoint();
+        var canSee = true;
+        for (obj in allWalls.members)
+        {
+            var tilemap:FlxTilemap = cast obj;
+            if (tilemap != null && !tilemap.ray(enemyPos, playerPos))
+            {
+                canSee = false;
+                break;
+            }
+        }
+        enemy.seesPlayer = canSee;
+        if (canSee)
+        {
+            enemy.playerPosition.set(playerPos.x, playerPos.y);
+        }
+    }
 
     function updateSpiritInteraction():Void
     {
